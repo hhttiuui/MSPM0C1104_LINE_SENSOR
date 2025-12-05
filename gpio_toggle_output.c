@@ -1,53 +1,29 @@
-/*
- * Copyright (c) 2023, Texas Instruments Incorporated
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * *  Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *
- * *  Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * *  Neither the name of Texas Instruments Incorporated nor the names of
- *    its contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
- * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
 
 #include "ti_msp_dl_config.h"
-//const uint32_t EEPROM[4096] __attribute((used)) __attribute((section(".EEPROM")))={0};
+
 #if 1
 /* 在假定 CPU_CLK = 24MHz 时，此延迟大约为 0.5 秒 */
 #endif
 #define DELAY (12000000)
-/* Flash 存储基地址 (选择一个安全的空闲扇区) */
-#define THRESH_BASE_ADDRESS (0x00001000)
-volatile DL_FLASHCTL_COMMAND_STATUS gCmdStatus;
 
-/* 魔术值，用来验证数据是否有效 */
-#define THRESH_MAGIC (0xA5A5A5A5)
+/* 设置为你实际规划的主 Flash 地址，需对齐到扇区边界，并落在可写主存区域 */
+#define THRESH_FLASH_ADDR   (0x00001600)   /* 示例地址：请替换为你的实际地址 */
+#define THRESH_MAGIC        (0x54485245u)   /* 'THRE' */
+#define THRESH_SECTOR_SIZE  (0x00001000u)   /* 示例扇区大小 4KB：按芯片实际值调整 */
+
+/* 可选：避免重复保存 */
+static uint8_t calib_saved_once = 0;
+
+/* ---------- Local prototypes ---------- */
+static bool flash_unprotect_erase(uint32_t addr);
+static bool flash_program_bytes(uint32_t addr, const uint8_t *data, uint32_t len);
+static bool flash_verify_bytes(uint32_t addr, const uint8_t *data, uint32_t len);
 
 volatile uint16_t ADC_Value[32];
 
 uint16_t adc_get_value[9];//单次采集的ADC值存储地
 uint8_t ADC_Value_digital;//8位数据，1的“位”对应检测到黑线
-uint8_t receive_data;       //用于串口接收
+uint8_t receive_data = 0;       //用于串口接收
 uint8_t time_count = 0;     //定时器测试变量
 volatile uint8_t g_adc_round = 0;//通道变换参数，为奇偶数时更换采集通道
 
@@ -95,14 +71,22 @@ void LED_show(void);
 void SetupOddChannels(void);//ͨ������
 void SetupEvenChannels(void);
 
-void Flash_WriteThresholds(void);
-void Flash_ReadThresholds(void);
+static bool flash_erase_sector(uint32_t addr);
+static bool flash_program_64(uint32_t addr, const uint32_t data32[2]);
+static bool flash_program_32(uint32_t addr, const uint32_t *data32);
+static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic);
+void load_thresholds_from_flash_if_valid(void);
+bool save_thresholds_to_flash_atomic(void);
 
+
+//volatile uint8_t *readData8 = ((volatile uint8_t*)THRESH_FLASH_ADDR);
+volatile uint8_t *td11 = (volatile uint8_t *)THRESH_FLASH_ADDR;
+volatile uint8_t *td12 = (volatile uint8_t *)THRESH_FLASH_ADDR + 32;
 int main(void)
 {
     SYSCFG_DL_init();
 
-	Flash_ReadThresholds();
+    load_thresholds_from_flash_if_valid();
 
     NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
     NVIC_EnableIRQ(UART_0_INST_INT_IRQN);//串口
@@ -119,49 +103,136 @@ int main(void)
 
     while (1) {
         LED_show();//LED显示
+        if(calib_stage==3)
+        {
+            bool a = save_thresholds_to_flash_atomic();
+        }
+        
         delay_cycles(100000);
+
     }
 }
 
-void Flash_WriteThresholds(void) {
-    ThresholdData data;
-    data.magic = THRESH_MAGIC;
-    for (int i = 0; i < 8; i++) {
-        data.upper[i] = adc_upper_thresh[i];
-        data.lower[i] = adc_lower_thresh[i];
+/* ---------- 将内存阈值写入 Flash（调用点见下文） ---------- */
+bool save_thresholds_to_flash_atomic(void)
+{
+    /* 仅在尚未保存且校准完成时调用（外部检查 calib_stage==3） */
+    if (calib_saved_once == 0) {
+        return true;
     }
 
-    /* 清除状态 */
-    DL_FlashCTL_executeClearStatus(FLASHCTL);
-
-    /* 解保护 */
-    DL_FlashCTL_unprotectSector(FLASHCTL, THRESH_BASE_ADDRESS, DL_FLASHCTL_REGION_SELECT_MAIN);
-
-    /* 擦除扇区 */
-    gCmdStatus = DL_FlashCTL_eraseMemoryFromRAM(
-        FLASHCTL, THRESH_BASE_ADDRESS, DL_FLASHCTL_COMMAND_SIZE_SECTOR);
-    if (gCmdStatus != DL_FLASHCTL_COMMAND_STATUS_PASSED) {
-        return; // 擦除失败
+    /* 1) 将 adc_upper_thresh / adc_lower_thresh 打包为 4 个 64-bit 单元（8 个 32-bit） */
+    uint32_t word32[8]; /* 4 * 64-bit = 8 * 32-bit */
+    for (int i = 0; i < 4; i++) {
+        /* 低 32 位：upper[2*i] | (upper[2*i+1] << 16) */
+        uint32_t low32 = ((uint32_t)adc_upper_thresh[2*i]) | (((uint32_t)adc_upper_thresh[2*i + 1]) << 16);
+        /* 高 32 位：lower[2*i] | (lower[2*i+1] << 16) */
+        uint32_t high32 = ((uint32_t)adc_lower_thresh[2*i]) | (((uint32_t)adc_lower_thresh[2*i + 1]) << 16);
+        word32[2*i + 0] = low32;
+        word32[2*i + 1] = high32;
     }
 
-    /* 写入数据 */
-    gCmdStatus = DL_FlashCTL_programMemoryFromRAM32(
-        FLASHCTL, THRESH_BASE_ADDRESS, (uint32_t*)&data);
-    if (gCmdStatus != DL_FLASHCTL_COMMAND_STATUS_PASSED) {
-        return; // 写入失败
+    /* 2) 擦除目标扇区（一次） */
+    if (!flash_erase_sector(THRESH_FLASH_ADDR)) {
+        return false;
     }
-}
 
-/* ---------------- Flash 读取函数 ---------------- */
-void Flash_ReadThresholds(void) {
-    ThresholdData *pData = (ThresholdData*)THRESH_BASE_ADDRESS;
-
-    if (pData->magic == THRESH_MAGIC) {
-        for (int i = 0; i < 8; i++) {
-            adc_upper_thresh[i] = pData->upper[i];
-            adc_lower_thresh[i] = pData->lower[i];
+    /* 3) 逐个 64-bit 写入（每次写入前清状态并解除保护以保险） */
+    for (int i = 0; i < 4; i++) {
+        uint32_t target_addr = THRESH_FLASH_ADDR + (i * 8); /* 每个 64-bit 占 8 字节 */
+        if (!flash_program_64(target_addr, &word32[2*i])) {
+            return false;
         }
     }
+   
+    
+    /* 4) 最后写入 magic（放在结构末尾偏移 32） */
+    uint32_t magic_addr = THRESH_FLASH_ADDR + 32; /* 32 字节偏移，magic 占 4 字节 */
+     if (!flash_program_32(magic_addr, (uint32_t[]){THRESH_MAGIC})) {
+         return false;
+     }
+   
+    /* 5) 写后校验 magic */
+     if (!flash_verify_magic(THRESH_FLASH_ADDR, THRESH_MAGIC)) {
+         return false;
+     }
+    //uint8_t readData = *readData8;
+    calib_saved_once = 1;
+    return true;
+}
+
+/* ---------- 上电加载函数：若 flash 中有有效 magic，则把阈值读回内存 ---------- */
+void load_thresholds_from_flash_if_valid(void)
+{
+     const ThresholdData *td = (const ThresholdData *)THRESH_FLASH_ADDR;
+    // if (td->magic != THRESH_MAGIC) {
+    //     /* 无效：保留运行时默认阈值（或触发重新校准） */
+    //     return;
+    // }
+
+    /* 有效：拷贝到运行时阈值数组 */
+    for (uint8_t i = 0; i < 8; i++) {
+        adc_upper_thresh[i] = td->upper[i];
+        adc_lower_thresh[i] = td->lower[i];
+    }
+
+    /* 标记已加载（避免重复保存） */
+    calib_saved_once = 1;
+}
+
+/* ---------- Flash 操作封装（基于你提供的 DL_FlashCTL API） ---------- */
+static bool flash_erase_sector(uint32_t addr)
+{
+    DL_FLASHCTL_COMMAND_STATUS status;
+
+    DL_FlashCTL_executeClearStatus(FLASHCTL);
+    DL_FlashCTL_unprotectSector(FLASHCTL, addr, DL_FLASHCTL_REGION_SELECT_MAIN);
+
+    /* 擦除整扇区：使用示例 API（若你的 SDK 名称不同请替换） */
+    status = DL_FlashCTL_eraseMemoryFromRAM(FLASHCTL, addr, DL_FLASHCTL_COMMAND_SIZE_SECTOR);
+    if (status == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
+        return false;
+    }
+    return true;
+}
+
+static bool flash_program_64(uint32_t addr, const uint32_t data32[2])
+{
+    DL_FLASHCTL_COMMAND_STATUS status;
+
+    DL_FlashCTL_executeClearStatus(FLASHCTL);
+    DL_FlashCTL_unprotectSector(FLASHCTL, addr, DL_FLASHCTL_REGION_SELECT_MAIN);
+
+    /* programMemoryFromRAM64 接受指向两个 32-bit 单元的指针 */
+    status = DL_FlashCTL_programMemoryFromRAM64(FLASHCTL, addr, (uint32_t *)data32);
+    if (status == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
+        return false;
+    }
+    return true;
+}
+
+static bool flash_program_32(uint32_t addr, const uint32_t *data32)
+{
+    DL_FLASHCTL_COMMAND_STATUS status;
+
+    DL_FlashCTL_executeClearStatus(FLASHCTL);
+    DL_FlashCTL_unprotectSector(FLASHCTL, addr, DL_FLASHCTL_REGION_SELECT_MAIN);
+
+    status = DL_FlashCTL_programMemoryFromRAM32(FLASHCTL, addr, (uint32_t *)data32);
+    if (status == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
+        return false;
+    }
+    return true;
+}
+
+static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic)
+{
+    const uint32_t *p = (const uint32_t *)(addr + 32);
+    /* 直接读取 flash 地址并比较 */
+    if (*p != expected_magic) {
+        return false;
+    }
+    return true;
 }
 
 void ADC12_0_INST_IRQHandler(void)//每500us调用一次
@@ -199,20 +270,27 @@ void ADC12_0_INST_IRQHandler(void)//每500us调用一次
     }
 }
 
+
+
 void UART_0_INST_IRQHandler(void)
 {
     receive_data = DL_UART_Main_receiveData(UART_0_INST);
-    DL_UART_Main_transmitData(UART_0_INST,receive_data);
+    if(receive_data == 1)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[0]);
+
+    
+    if(receive_data == 2)DL_UART_Main_transmitData(UART_0_INST,*td11);
 }
 
 void TIMER_0_INST_IRQHandler(void)//该定时器用于每10ms发送一次数据
 {
     time_count++;
-    DL_UART_Main_transmitData(UART_0_INST,ADC_Value_digital);
+    if(receive_data == 0)DL_UART_Main_transmitData(UART_0_INST,ADC_Value_digital);
+    
     /* 处理校准 LED 超时（每个 tick 约 10ms） */
     if (calib_show_ticks > 0) {
         calib_show_ticks--;
         if (calib_show_ticks == 0) {
+             
             /* 超时到期：退出校准模式并恢复正常显示 */
             calib_stage = 0;
         }
@@ -297,8 +375,8 @@ void TIMER_2_INST_IRQHandler(void)//用于按键
                     }
 
                     calib_stage = 3; /* 完成 */
+                   
                     /* 指示完成：短时间点亮所有 LED（由 TIMER_0 处理） */
-					//Flash_WriteThresholds();
                     calib_show_ticks = 100; /* 100 * 10ms ≈ 1s */
                 }
             }
