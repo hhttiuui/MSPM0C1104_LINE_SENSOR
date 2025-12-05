@@ -1,103 +1,81 @@
 
 #include "ti_msp_dl_config.h"
 
-#if 1
-/* 在假定 CPU_CLK = 24MHz 时，此延迟大约为 0.5 秒 */
-#endif
 #define DELAY (12000000)
+#define THRESH_FLASH_ADDR   (0x00001600)   /* 经过测试，本代码实际占用约1210，故需在1600后开辟 */
+//#define THRESH_MAGIC        (0x54485245u)   /* 校准参数（已经舍弃） */
 
-/* 设置为你实际规划的主 Flash 地址，需对齐到扇区边界，并落在可写主存区域 */
-#define THRESH_FLASH_ADDR   (0x00001600)   /* 示例地址：请替换为你的实际地址 */
-#define THRESH_MAGIC        (0x54485245u)   /* 'THRE' */
-#define THRESH_SECTOR_SIZE  (0x00001000u)   /* 示例扇区大小 4KB：按芯片实际值调整 */
-
-/* 可选：避免重复保存 */
-static uint8_t calib_saved_once = 0;
-
-/* ---------- Local prototypes ---------- */
-static bool flash_unprotect_erase(uint32_t addr);
-static bool flash_program_bytes(uint32_t addr, const uint8_t *data, uint32_t len);
-static bool flash_verify_bytes(uint32_t addr, const uint8_t *data, uint32_t len);
+static uint8_t calib_saved_once = 0;/* 避免重复保存 */
 
 volatile uint16_t ADC_Value[32];
-
+volatile uint8_t g_adc_round = 0;//通道变换参数，为奇偶数时更换采集通道
 uint16_t adc_get_value[9];//单次采集的ADC值存储地
 uint8_t ADC_Value_digital;//8位数据，1的“位”对应检测到黑线
 uint8_t receive_data = 0;       //用于串口接收
 uint8_t time_count = 0;     //定时器测试变量
-volatile uint8_t g_adc_round = 0;//通道变换参数，为奇偶数时更换采集通道
 
-/* 用于存储4次采集的八个通道的数据 */
-static uint16_t adc_samples[8][4];
+static uint16_t adc_samples[8][4];/* 用于存储4次采集的八个通道的数据 */
 static uint8_t adc_sample_cnt = 0; /* 0-3，当记到3时，进行滤波和数字转换 */
 
-/* 上下限阈值数组（运行时内存，仅校准阶段更新，不再持久化） */
-static uint16_t adc_upper_thresh[8] = {3000,3000,3000,3000,3000,3000,3000,3000};
+static uint16_t adc_upper_thresh[8] = {3000,3000,3000,3000,3000,3000,3000,3000};/* 上下限阈值数组 */
 static uint16_t adc_lower_thresh[8] = {1000,1000,1000,1000,1000,1000,1000,1000};
+static uint16_t adc_last_mean[8] = {0};/* 上一次通道的均值 (在 xunji_adc_to_digital中更新) */
 
-/* 上一次通道的均值 (在 xunji_adc_to_digital中更新) */
-static uint16_t adc_last_mean[8] = {0};
-
-/* 按键状态检测 (TIMER_2 每5ms触发一次) */
 static uint8_t key_samples[4] = {0}; /* 4次采集 1 = 按下（低电平）, 0 = 没按下（高电平） */
 static uint8_t key_sample_idx = 0;
 static uint16_t key_press_ticks = 0; /* 计数器，用于判断长按短按 */
 static uint8_t key_prev_state = 0; /* 判断按键是否松开0=松开,1=按下 */
 static uint8_t key_long_detected = 0; /* 用于避免重复触发长按事件 */
+volatile uint8_t key_short_flag = 0;/*按键事件，短按（<500ms）*/
+volatile uint8_t key_long_flag = 0;/*按键事件，长按（>500ms）*/
 
-/*按键事件，短按（<500ms），长按（>500ms）*/
-volatile uint8_t key_short_flag = 0;
-volatile uint8_t key_long_flag = 0;
-
-/* 校准状态机 */
-/* 0 = 空闲, 1 = 等待黑色+短按, 2 = 等待白色+短按, 3 = 完成 */
-static uint8_t calib_stage = 0;
+static uint8_t calib_stage = 0;/*校准状态机， 0 = 空闲, 1 = 等待黑色+短按, 2 = 等待白色+短按, 3 = 完成 */
 static uint16_t calib_black[8];
 static uint16_t calib_white[8];
 
-/* 用于LED显示计数，当完成校准后LED会全量1s，然后恢复默认 */
-static uint16_t calib_show_ticks = 0;
+static uint16_t calib_show_ticks = 0;/* 用于LED显示计数，当完成校准后LED会全量1s，然后恢复默认 */
 
-/* 阈值数据结构 */
-typedef struct {
+volatile uint8_t *td11 = (volatile uint8_t *)THRESH_FLASH_ADDR;//测试地址
+volatile uint8_t *td12 = (volatile uint8_t *)THRESH_FLASH_ADDR + 32;
+
+
+typedef struct /* 阈值数据结构 */
+{
     uint32_t magic;          // 标志位，用于判断数据是否有效
     uint16_t upper[8];
     uint16_t lower[8];
 } ThresholdData;
 
+
+/* 相关函数声明（具体功能见下方）：*/
 void xunji_adc_to_digital(void);
 void LED_show(void);
-
 void SetupOddChannels(void);//ͨ������
 void SetupEvenChannels(void);
+void load_thresholds_from_flash_if_valid(void);
 
 static bool flash_erase_sector(uint32_t addr);
 static bool flash_program_64(uint32_t addr, const uint32_t data32[2]);
-static bool flash_program_32(uint32_t addr, const uint32_t *data32);
-static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic);
-void load_thresholds_from_flash_if_valid(void);
+//static bool flash_program_32(uint32_t addr, const uint32_t *data32);
+//static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic);
 bool save_thresholds_to_flash_atomic(void);
 
 
-//volatile uint8_t *readData8 = ((volatile uint8_t*)THRESH_FLASH_ADDR);
-volatile uint8_t *td11 = (volatile uint8_t *)THRESH_FLASH_ADDR;
-volatile uint8_t *td12 = (volatile uint8_t *)THRESH_FLASH_ADDR + 32;
 int main(void)
 {
     SYSCFG_DL_init();
 
-    load_thresholds_from_flash_if_valid();
+    load_thresholds_from_flash_if_valid();//上电读取flash数据
 
     NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
     NVIC_EnableIRQ(UART_0_INST_INT_IRQN);//串口
     NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);//用于发送
     NVIC_EnableIRQ(TIMER_2_INST_INT_IRQN);//用于按键
-
     NVIC_EnableIRQ(ADC12_0_INST_INT_IRQN);//ADC采集完成的中断
     DL_ADC12_startConversion(ADC12_0_INST);//启动ADC
     DL_TimerA_startCounter(TIMER_1_INST);//启动TIM1用于触发ADC
 
-    DL_GPIO_setPins(GPIO_LEDS_PORT,GPIO_LEDS_USER_LED_1_PIN);
+    DL_GPIO_setPins(GPIO_LEDS_PORT,GPIO_LEDS_USER_LED_1_PIN);//测试
 
 
 
@@ -113,7 +91,16 @@ int main(void)
     }
 }
 
-/* ---------- 将内存阈值写入 Flash（调用点见下文） ---------- */
+/* 
+函数功能：将上下限阈值写入flash
+工作流程：
+1，检测calib_saved_once，确保仅写入一次
+2，将上下限阈值数组进行打包，将16个uint16类型数据转换成8个uint32类型
+3，进行数据写入，调用64位数据写入flash的函数（tisdk中，该函数是将两个32位数据写入，达成写入64位数据的目的）
+4，置标志位calib_saved_once为1，防止重复写入
+调用方式：
+在本工程中利用calib_stage标志位，在完成校准后写入数据，在while（1）循环调用
+*/
 bool save_thresholds_to_flash_atomic(void)
 {
     /* 仅在尚未保存且校准完成时调用（外部检查 calib_stage==3） */
@@ -146,22 +133,29 @@ bool save_thresholds_to_flash_atomic(void)
     }
    
     
-    /* 4) 最后写入 magic（放在结构末尾偏移 32） */
-    uint32_t magic_addr = THRESH_FLASH_ADDR + 32; /* 32 字节偏移，magic 占 4 字节 */
-     if (!flash_program_32(magic_addr, (uint32_t[]){THRESH_MAGIC})) {
-         return false;
-     }
+    // /* 4) 最后写入 magic（放在结构末尾偏移 32） */
+    // uint32_t magic_addr = THRESH_FLASH_ADDR + 32; /* 32 字节偏移，magic 占 4 字节 */
+    //  if (!flash_program_32(magic_addr, (uint32_t[]){THRESH_MAGIC})) {
+    //      return false;
+    //  }
    
-    /* 5) 写后校验 magic */
-     if (!flash_verify_magic(THRESH_FLASH_ADDR, THRESH_MAGIC)) {
-         return false;
-     }
+    // /* 5) 写后校验 magic */
+    //  if (!flash_verify_magic(THRESH_FLASH_ADDR, THRESH_MAGIC)) {
+    //      return false;
+    //  }
     //uint8_t readData = *readData8;
+
     calib_saved_once = 1;
     return true;
 }
 
-/* ---------- 上电加载函数：若 flash 中有有效 magic，则把阈值读回内存 ---------- */
+/* 
+函数功能：在上电时读取flash的上下限阈值数据
+工作流程：
+1，通过指针读取对应地址的flash的数据
+调用方法：
+在SYSCFG_DL_init();后调用
+ */
 void load_thresholds_from_flash_if_valid(void)
 {
      const ThresholdData *td = (const ThresholdData *)THRESH_FLASH_ADDR;
@@ -180,7 +174,16 @@ void load_thresholds_from_flash_if_valid(void)
     calib_saved_once = 1;
 }
 
-/* ---------- Flash 操作封装（基于你提供的 DL_FlashCTL API） ---------- */
+/* 
+函数功能：进行扇区擦除
+工作流程：
+1，清除相关标志位
+2，解除对应地址的保护
+3，擦除扇区
+4，返回是否成功擦除扇区结果
+调用方法：
+在进行数据写入前调用
+ */
 static bool flash_erase_sector(uint32_t addr)
 {
     DL_FLASHCTL_COMMAND_STATUS status;
@@ -196,6 +199,16 @@ static bool flash_erase_sector(uint32_t addr)
     return true;
 }
 
+/* 
+函数功能：进行数据写入
+工作流程：
+1，清除相关标志位
+2，解除对应地址的保护
+3，写入两个32位数据
+4，返回是否成功写入结果
+调用方法：
+在save_thresholds_to_flash_atomic循环调用，直到全部数据都写入
+ */
 static bool flash_program_64(uint32_t addr, const uint32_t data32[2])
 {
     DL_FLASHCTL_COMMAND_STATUS status;
@@ -211,30 +224,46 @@ static bool flash_program_64(uint32_t addr, const uint32_t data32[2])
     return true;
 }
 
-static bool flash_program_32(uint32_t addr, const uint32_t *data32)
-{
-    DL_FLASHCTL_COMMAND_STATUS status;
+/* 
+废案，用于写入校准数据的，但是经过调试，发现不用校准相关逻辑就可以写入flash了，固废除
+ */
+// static bool flash_program_32(uint32_t addr, const uint32_t *data32)
+// {
+//     DL_FLASHCTL_COMMAND_STATUS status;
 
-    DL_FlashCTL_executeClearStatus(FLASHCTL);
-    DL_FlashCTL_unprotectSector(FLASHCTL, addr, DL_FLASHCTL_REGION_SELECT_MAIN);
+//     DL_FlashCTL_executeClearStatus(FLASHCTL);
+//     DL_FlashCTL_unprotectSector(FLASHCTL, addr, DL_FLASHCTL_REGION_SELECT_MAIN);
 
-    status = DL_FlashCTL_programMemoryFromRAM32(FLASHCTL, addr, (uint32_t *)data32);
-    if (status == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
-        return false;
-    }
-    return true;
-}
+//     status = DL_FlashCTL_programMemoryFromRAM32(FLASHCTL, addr, (uint32_t *)data32);
+//     if (status == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
+//         return false;
+//     }
+//     return true;
+// }
 
-static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic)
-{
-    const uint32_t *p = (const uint32_t *)(addr + 32);
-    /* 直接读取 flash 地址并比较 */
-    if (*p != expected_magic) {
-        return false;
-    }
-    return true;
-}
+/* 
+废案，用于比较校准数据
+ */
+// static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic)
+// {
+//     const uint32_t *p = (const uint32_t *)(addr + 32);
+//     /* 直接读取 flash 地址并比较 */
+//     if (*p != expected_magic) {
+//         return false;
+//     }
+//     return true;
+// }
 
+/* 
+函数功能：进行ADC采集
+工作流程：
+1，本adc为500us触发一次采样，完成一次四通道的采样后进入该中断
+2，关闭ADC
+3，进行通道的切换
+4，调用xunji_adc_to_digital();实现八通道值映射到uint8_t上
+调用方法：
+等待中断
+ */
 void ADC12_0_INST_IRQHandler(void)//每500us调用一次
 {
     switch (DL_ADC12_getPendingInterrupt(ADC12_0_INST)) {
@@ -270,17 +299,40 @@ void ADC12_0_INST_IRQHandler(void)//每500us调用一次
     }
 }
 
-
-
+/* 
+函数功能：串口调试
+工作流程：
+1，仅用于调试，测试
+调用方法：
+等待中断
+ */
 void UART_0_INST_IRQHandler(void)
 {
     receive_data = DL_UART_Main_receiveData(UART_0_INST);
-    if(receive_data == 1)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[0]);
+    if(receive_data == 1)DL_UART_Main_transmitData(UART_0_INST,*td11);
+    if(receive_data == 2)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[0]);
+    if(receive_data == 3)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[1]);
+    if(receive_data == 4)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[2]);
+    if(receive_data == 5)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[3]);
+
+    if(receive_data == 6)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[4]);
+    if(receive_data == 7)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[5]);
+    if(receive_data == 8)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[6]);
+    if(receive_data == 9)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[7]);
+ 
 
     
-    if(receive_data == 2)DL_UART_Main_transmitData(UART_0_INST,*td11);
+    
 }
 
+/* 
+函数功能：定时发送数据+清除标志位
+工作流程：
+1，每10ms发送一次数据
+2，通过calib_show_ticks实现无阻塞清除calib_stage标志位
+调用方法：
+等待中断
+ */
 void TIMER_0_INST_IRQHandler(void)//该定时器用于每10ms发送一次数据
 {
     time_count++;
@@ -290,13 +342,22 @@ void TIMER_0_INST_IRQHandler(void)//该定时器用于每10ms发送一次数据
     if (calib_show_ticks > 0) {
         calib_show_ticks--;
         if (calib_show_ticks == 0) {
-             
             /* 超时到期：退出校准模式并恢复正常显示 */
             calib_stage = 0;
         }
     }
 }
 
+/* 
+函数功能：按键检测+阈值校准
+工作流程：
+1，每5ms触发一次
+2，通过4次采样，有三次检测到按键按下，视为按键按下
+3，检测短按长按
+4，长按后触发校准
+调用方法：
+等待中断
+ */
 void TIMER_2_INST_IRQHandler(void)//用于按键
 {
     /* 每5ms采集一次引脚，并保留4次*/
@@ -387,6 +448,15 @@ void TIMER_2_INST_IRQHandler(void)//用于按键
     }
 }
 
+/* 
+函数功能：八通道映射到uint8_t
+工作流程：
+1，采集4次，进行均值滤波
+2，将采滤波后的值与上下限阈值比较
+3，映射到uint8_t
+调用方法：
+在ADC采集完成中断中调用
+ */
 void xunji_adc_to_digital(void)//每采集4次进行一次处理，包括均值滤波，转数字
 {
     /* 将当前 8 路采样值存入样本缓存 */
@@ -425,6 +495,14 @@ void xunji_adc_to_digital(void)//每采集4次进行一次处理，包括均值�
     }
 }
 
+/* 
+函数功能：4颗LED交替显示八通道+校准提示显示
+工作流程：
+1，通过判断ADC_Value_digital对应位的01实现点亮对应的LED
+2，通过calib_stage标志位显示到了哪个校准阶段
+调用方法：
+whlie（1）循环调用
+ */
 void LED_show(void)
 {
     /* 若处于校准阶段，则显示固定指示而非 ADC 位
@@ -475,6 +553,13 @@ void LED_show(void)
         DL_GPIO_setPins(GPIO_LEDS_PORT, GPIO_LEDS_USER_LED_4_PIN);
 }
 
+/* 
+函数功能：ADC通道切换
+工作流程：
+1，通过改变DL_ADC12_configConversionMem函数中“DL_ADC12_INPUT_CHAN_5”的值实现
+调用方法：
+在ADC采集完成中断中调用
+ */
 void SetupOddChannels(void) 
 {
     DL_ADC12_configConversionMem(ADC12_0_INST, ADC12_0_ADCMEM_0,
@@ -491,6 +576,13 @@ void SetupOddChannels(void)
         DL_ADC12_BURN_OUT_SOURCE_DISABLED, DL_ADC12_TRIGGER_MODE_TRIGGER_NEXT, DL_ADC12_WINDOWS_COMP_MODE_DISABLED);
 }
 
+/* 
+函数功能：ADC通道切换
+工作流程：
+1，通过改变DL_ADC12_configConversionMem函数中“DL_ADC12_INPUT_CHAN_5”的值实现
+调用方法：
+在ADC采集完成中断中调用
+ */
 void SetupEvenChannels(void) 
 {
     DL_ADC12_configConversionMem(ADC12_0_INST, ADC12_0_ADCMEM_0,
