@@ -104,7 +104,7 @@ int main(void)
 bool save_thresholds_to_flash_atomic(void)
 {
     /* 仅在尚未保存且校准完成时调用（外部检查 calib_stage==3） */
-    if (calib_saved_once == 0) {
+    if (calib_saved_once) {
         return true;
     }
 
@@ -158,21 +158,33 @@ bool save_thresholds_to_flash_atomic(void)
  */
 void load_thresholds_from_flash_if_valid(void)
 {
-     const ThresholdData *td = (const ThresholdData *)THRESH_FLASH_ADDR;
-    // if (td->magic != THRESH_MAGIC) {
-    //     /* 无效：保留运行时默认阈值（或触发重新校准） */
+    /* 1) 先检查 magic（放在偏移 32） */
+    const volatile uint32_t *pmagic = (const volatile uint32_t *)(THRESH_FLASH_ADDR + 32);
+    // if (*pmagic != THRESH_MAGIC) {
+    //     // 无效数据，保持默认阈值
     //     return;
     // }
 
-    /* 有效：拷贝到运行时阈值数组 */
-    for (uint8_t i = 0; i < 8; i++) {
-        adc_upper_thresh[i] = td->upper[i];
-        adc_lower_thresh[i] = td->lower[i];
+    /* 2) 按写入时的打包方式拆解 4 个 64-bit 单元 */
+    const volatile uint32_t *p32 = (const volatile uint32_t *)THRESH_FLASH_ADDR;
+
+    for (int i = 0; i < 4; i++) {
+        uint32_t low32  = p32[2*i];     // 上限阈值两个
+        uint32_t high32 = p32[2*i + 1]; // 下限阈值两个
+
+        // 拆解低 32 位：upper[2*i], upper[2*i+1]
+        adc_upper_thresh[2*i]   = (uint16_t)(low32 & 0xFFFF);
+        adc_upper_thresh[2*i+1] = (uint16_t)((low32 >> 16) & 0xFFFF);
+
+        // 拆解高 32 位：lower[2*i], lower[2*i+1]
+        adc_lower_thresh[2*i]   = (uint16_t)(high32 & 0xFFFF);
+        adc_lower_thresh[2*i+1] = (uint16_t)((high32 >> 16) & 0xFFFF);
     }
 
-    /* 标记已加载（避免重复保存） */
+    /* 3) 标记已加载 */
     calib_saved_once = 1;
 }
+
 
 /* 
 函数功能：进行扇区擦除
@@ -310,7 +322,7 @@ void UART_0_INST_IRQHandler(void)
 {
     receive_data = DL_UART_Main_receiveData(UART_0_INST);
     if(receive_data == 1)DL_UART_Main_transmitData(UART_0_INST,*td11);
-    if(receive_data == 2)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[0]);
+    if(receive_data == 2)DL_UART_Main_transmitData(UART_0_INST,(uint8_t)adc_upper_thresh[0]);
     if(receive_data == 3)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[1]);
     if(receive_data == 4)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[2]);
     if(receive_data == 5)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[3]);
@@ -436,6 +448,7 @@ void TIMER_2_INST_IRQHandler(void)//用于按键
                     }
 
                     calib_stage = 3; /* 完成 */
+                    calib_saved_once = 0;
                    
                     /* 指示完成：短时间点亮所有 LED（由 TIMER_0 处理） */
                     calib_show_ticks = 100; /* 100 * 10ms ≈ 1s */
