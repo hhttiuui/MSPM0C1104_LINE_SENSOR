@@ -1,9 +1,46 @@
 
+/*
+ * ============================================================
+ * 串口命令行使用说明（115200-8-N-1，以 \\r\\n 结尾）
+ * ============================================================
+ *   STOP              → 停止自动发送，返回 TESTING
+ *   START             → 恢复自动发送，保存当前挡位到 Flash
+ *   CHANGE UARTMS X   → 切换发送间隔为 X ms
+ *                       可选: 2, 4, 5, 6, 8, 10, 20
+ *                       成功返回 FINISH，失败返回 error
+ *   CHECK THRESH      → 查看 8 通道上下限阈值
+ * ============================================================
+ */
 #include "ti_msp_dl_config.h"
 
+/* 内联实现的字符串函数，避免依赖标准库 */
+static int my_strcmp(const char *a, const char *b)
+{
+    while (*a && (*a == *b)) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+static int my_strncmp(const char *a, const char *b, unsigned int n)
+{
+    if (n == 0) return 0;
+    while (--n && *a && (*a == *b)) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
 #define DELAY (12000000)
-#define THRESH_FLASH_ADDR   (0x00001600)   /* 经过测试，本代码实际占用约1210，故需在1600后开辟 */
+#define THRESH_FLASH_ADDR   (0x00001800)   /* 经过测试，本代码实际占用约1660，故需在1800后开辟 */
 //#define THRESH_MAGIC        (0x54485245u)   /* 校准参数（已经舍弃） */
+
+/* ──── UART 命令与多挡位发送 ──── */
+#define UART_CMD_BUF_SIZE           32
+
+static const uint16_t uart_tx_intervals[] = {2, 4, 5, 6, 8, 10, 20};
+static const uint8_t  uart_tx_interval_count = 7;
+static uint16_t       uart_tx_interval_ms = 10;  /* 默认10ms */
+static uint16_t       uart_tx_tick = 0;
+static uint8_t        uart_tx_enabled = 1;
+static char            uart_cmd_buf[UART_CMD_BUF_SIZE];
+static uint8_t         uart_cmd_idx = 0;
 
 static uint8_t calib_saved_once = 0;/* 避免重复保存 */
 
@@ -11,7 +48,7 @@ volatile uint16_t ADC_Value[32];
 volatile uint8_t g_adc_round = 0;//通道变换参数，为奇偶数时更换采集通道
 uint16_t adc_get_value[9];//单次采集的ADC值存储地
 uint8_t ADC_Value_digital;//8位数据，1的“位”对应检测到黑线
-uint8_t receive_data = 0;       //用于串口接收
+
 uint8_t time_count = 0;     //定时器测试变量
 
 static uint16_t adc_samples[8][4];/* 用于存储4次采集的八个通道的数据 */
@@ -52,20 +89,23 @@ void xunji_adc_to_digital(void);
 void LED_show(void);
 void SetupOddChannels(void);//ͨ������
 void SetupEvenChannels(void);
-void load_thresholds_from_flash_if_valid(void);
+void load_all_from_flash(void);
 
 static bool flash_erase_sector(uint32_t addr);
 static bool flash_program_64(uint32_t addr, const uint32_t data32[2]);
+static void uart_send_string(const char *str);
+static void uart_send_uint16(uint16_t val);
+static void uart_process_command(void);
 //static bool flash_program_32(uint32_t addr, const uint32_t *data32);
 //static bool flash_verify_magic(uint32_t addr, uint32_t expected_magic);
-bool save_thresholds_to_flash_atomic(void);
+bool save_all_to_flash(void);
 
 
 int main(void)
 {
     SYSCFG_DL_init();
 
-    load_thresholds_from_flash_if_valid();//上电读取flash数据
+    load_all_from_flash();//上电读取flash数据（阈值+UART挡位）
 
     NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
     NVIC_EnableIRQ(UART_0_INST_INT_IRQN);//串口
@@ -83,7 +123,7 @@ int main(void)
         LED_show();//LED显示
         if(calib_stage==3)
         {
-            bool a = save_thresholds_to_flash_atomic();
+            bool a = save_all_to_flash();
         }
         
         delay_cycles(100000);
@@ -92,93 +132,90 @@ int main(void)
 }
 
 /* 
-函数功能：将上下限阈值写入flash
+函数功能：将上下限阈值+UART发送挡位写入flash
 工作流程：
-1，检测calib_saved_once，确保仅写入一次
-2，将上下限阈值数组进行打包，将16个uint16类型数据转换成8个uint32类型
-3，进行数据写入，调用64位数据写入flash的函数（tisdk中，该函数是将两个32位数据写入，达成写入64位数据的目的）
+1，检测calib_saved_once，确保仅写入一次（但START命令会清零以允许重新保存）
+2，将阈值打包为4个64-bit + 1个64-bit(保存UART挡位) = 5个64-bit单元
+3，擦除扇区后逐一写入
 4，置标志位calib_saved_once为1，防止重复写入
 调用方式：
-在本工程中利用calib_stage标志位，在完成校准后写入数据，在while（1）循环调用
+校准完成时(calib_stage==3)自动调用; START 命令也会调用
 */
-bool save_thresholds_to_flash_atomic(void)
+bool save_all_to_flash(void)
 {
-    /* 仅在尚未保存且校准完成时调用（外部检查 calib_stage==3） */
+    /* 仅在尚未保存时调用（外部可先清零 calib_saved_once 以允许重新保存） */
     if (calib_saved_once) {
         return true;
     }
 
-    /* 1) 将 adc_upper_thresh / adc_lower_thresh 打包为 4 个 64-bit 单元（8 个 32-bit） */
-    uint32_t word32[8]; /* 4 * 64-bit = 8 * 32-bit */
+    /* 1) 打包阈值：4 个 64-bit = 8 个 32-bit */
+    uint32_t word32[10]; /* 5 x 64-bit = 10 x 32-bit */
     for (int i = 0; i < 4; i++) {
-        /* 低 32 位：upper[2*i] | (upper[2*i+1] << 16) */
         uint32_t low32 = ((uint32_t)adc_upper_thresh[2*i]) | (((uint32_t)adc_upper_thresh[2*i + 1]) << 16);
-        /* 高 32 位：lower[2*i] | (lower[2*i+1] << 16) */
         uint32_t high32 = ((uint32_t)adc_lower_thresh[2*i]) | (((uint32_t)adc_lower_thresh[2*i + 1]) << 16);
         word32[2*i + 0] = low32;
         word32[2*i + 1] = high32;
     }
+
+    /* 第 5 个 64-bit：保存 UART 发送间隔（低32位=间隔值, 高32位=0） */
+    word32[8] = (uint32_t)uart_tx_interval_ms;
+    word32[9] = 0;
 
     /* 2) 擦除目标扇区（一次） */
     if (!flash_erase_sector(THRESH_FLASH_ADDR)) {
         return false;
     }
 
-    /* 3) 逐个 64-bit 写入（每次写入前清状态并解除保护以保险） */
-    for (int i = 0; i < 4; i++) {
-        uint32_t target_addr = THRESH_FLASH_ADDR + (i * 8); /* 每个 64-bit 占 8 字节 */
+    /* 3) 逐个 64-bit 写入（5 次） */
+    for (int i = 0; i < 5; i++) {
+        uint32_t target_addr = THRESH_FLASH_ADDR + (i * 8);
         if (!flash_program_64(target_addr, &word32[2*i])) {
             return false;
         }
     }
-   
-    
-    // /* 4) 最后写入 magic（放在结构末尾偏移 32） */
-    // uint32_t magic_addr = THRESH_FLASH_ADDR + 32; /* 32 字节偏移，magic 占 4 字节 */
-    //  if (!flash_program_32(magic_addr, (uint32_t[]){THRESH_MAGIC})) {
-    //      return false;
-    //  }
-   
-    // /* 5) 写后校验 magic */
-    //  if (!flash_verify_magic(THRESH_FLASH_ADDR, THRESH_MAGIC)) {
-    //      return false;
-    //  }
-    //uint8_t readData = *readData8;
 
     calib_saved_once = 1;
     return true;
 }
 
 /* 
-函数功能：在上电时读取flash的上下限阈值数据
+函数功能：在上电时读取flash的上下限阈值数据及UART发送挡位
 工作流程：
 1，通过指针读取对应地址的flash的数据
+2，拆解8路上下限阈值
+3，读取第5个64-bit中的UART挡位值
 调用方法：
 在SYSCFG_DL_init();后调用
  */
-void load_thresholds_from_flash_if_valid(void)
+void load_all_from_flash(void)
 {
-    /* 1) 先检查 magic（放在偏移 32） */
-    const volatile uint32_t *pmagic = (const volatile uint32_t *)(THRESH_FLASH_ADDR + 32);
-    // if (*pmagic != THRESH_MAGIC) {
-    //     // 无效数据，保持默认阈值
-    //     return;
-    // }
-
-    /* 2) 按写入时的打包方式拆解 4 个 64-bit 单元 */
     const volatile uint32_t *p32 = (const volatile uint32_t *)THRESH_FLASH_ADDR;
 
+    /* 1) 按写入时的打包方式拆解 4 个 64-bit 单元（阈值） */
     for (int i = 0; i < 4; i++) {
         uint32_t low32  = p32[2*i];     // 上限阈值两个
         uint32_t high32 = p32[2*i + 1]; // 下限阈值两个
 
-        // 拆解低 32 位：upper[2*i], upper[2*i+1]
         adc_upper_thresh[2*i]   = (uint16_t)(low32 & 0xFFFF);
         adc_upper_thresh[2*i+1] = (uint16_t)((low32 >> 16) & 0xFFFF);
 
-        // 拆解高 32 位：lower[2*i], lower[2*i+1]
         adc_lower_thresh[2*i]   = (uint16_t)(high32 & 0xFFFF);
         adc_lower_thresh[2*i+1] = (uint16_t)((high32 >> 16) & 0xFFFF);
+    }
+
+    /* 2) 读取第 5 个 64-bit 中的 UART 发送间隔（偏移 32 字节处） */
+    uint32_t saved_interval = p32[8];
+    if (saved_interval >= 2 && saved_interval <= 20) {
+        uint8_t valid = 0;
+        for (uint8_t i = 0; i < uart_tx_interval_count; i++) {
+            if (saved_interval == uart_tx_intervals[i]) {
+                valid = 1;
+                break;
+            }
+        }
+        if (valid) {
+            uart_tx_interval_ms = (uint16_t)saved_interval;
+        }
     }
 
     /* 3) 标记已加载 */
@@ -219,7 +256,7 @@ static bool flash_erase_sector(uint32_t addr)
 3，写入两个32位数据
 4，返回是否成功写入结果
 调用方法：
-在save_thresholds_to_flash_atomic循环调用，直到全部数据都写入
+在save_all_to_flash循环调用，直到全部数据都写入
  */
 static bool flash_program_64(uint32_t addr, const uint32_t data32[2])
 {
@@ -311,50 +348,140 @@ void ADC12_0_INST_IRQHandler(void)//每500us调用一次
     }
 }
 
+/* ──── 串口辅助函数 ──── */
+
+/* 发送字符串（阻塞） */
+static void uart_send_string(const char *str)
+{
+    while (*str) {
+        DL_UART_Main_transmitData(UART_0_INST, (uint8_t)(*str));
+        str++;
+    }
+}
+
+/* 发送 uint16 十进制 */
+static void uart_send_uint16(uint16_t val)
+{
+    char buf[6];
+    uint8_t i = 0;
+    if (val == 0) {
+        DL_UART_Main_transmitData(UART_0_INST, '0');
+        return;
+    }
+    while (val > 0) {
+        buf[i++] = (char)('0' + (val % 10));
+        val /= 10;
+    }
+    while (i > 0) {
+        DL_UART_Main_transmitData(UART_0_INST, (uint8_t)buf[--i]);
+    }
+}
+
+/* 解析一行命令并执行 */
+static void uart_process_command(void)
+{
+    uart_cmd_buf[uart_cmd_idx] = '\0';
+
+    if (my_strcmp(uart_cmd_buf, "STOP") == 0) {
+        uart_tx_enabled = 0;
+        uart_send_string("TESTING\r\n");
+    }
+    else if (my_strcmp(uart_cmd_buf, "START") == 0) {
+        uart_tx_enabled = 1;
+        /* 保存当前 UART 发送挡位到 Flash */
+        calib_saved_once = 0;
+        save_all_to_flash();
+        uart_send_string("START\r\n");
+    }
+    else if (my_strncmp(uart_cmd_buf, "CHANGE UARTMS ", 14) == 0) {
+        uint16_t new_ms = 0;
+        const char *p = &uart_cmd_buf[14];
+        while (*p >= '0' && *p <= '9') {
+            new_ms = (uint16_t)(new_ms * 10 + (uint16_t)(*p - '0'));
+            p++;
+        }
+        uint8_t valid = 0;
+        for (uint8_t i = 0; i < uart_tx_interval_count; i++) {
+            if (new_ms == uart_tx_intervals[i]) {
+                valid = 1;
+                break;
+            }
+        }
+        if (valid) {
+            uart_tx_interval_ms = new_ms;
+            uart_tx_tick = 0;
+            uart_send_string("FINISH\r\n");
+        } else {
+            uart_send_string("error\r\n");
+        }
+    }
+    else if (my_strcmp(uart_cmd_buf, "CHECK THRESH") == 0) {
+        uart_send_string("THRESH:\r\n");
+        for (uint8_t ch = 0; ch < 8; ch++) {
+            uart_send_string(" CH");
+            uart_send_uint16(ch);
+            uart_send_string(":U=");
+            uart_send_uint16(adc_upper_thresh[ch]);
+            uart_send_string(" L=");
+            uart_send_uint16(adc_lower_thresh[ch]);
+            uart_send_string("\r\n");
+        }
+    }
+    else if (uart_cmd_idx > 0) {
+        /* 未知命令 */
+        uart_send_string("?\r\n");
+    }
+
+    uart_cmd_idx = 0;
+}
+
 /* 
-函数功能：串口调试
+函数功能：串口命令行接收
 工作流程：
-1，仅用于调试，测试
+1，逐字节接收，以 \\r 或 \\n 为行结束符
+2，累积到 uart_cmd_buf 后调用 uart_process_command 解析
 调用方法：
 等待中断
  */
 void UART_0_INST_IRQHandler(void)
 {
-    receive_data = DL_UART_Main_receiveData(UART_0_INST);
-    if(receive_data == 1)DL_UART_Main_transmitData(UART_0_INST,*td11);
-    if(receive_data == 2)DL_UART_Main_transmitData(UART_0_INST,(uint8_t)adc_upper_thresh[0]);
-    if(receive_data == 3)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[1]);
-    if(receive_data == 4)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[2]);
-    if(receive_data == 5)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[3]);
+    uint8_t ch = DL_UART_Main_receiveData(UART_0_INST);
 
-    if(receive_data == 6)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[4]);
-    if(receive_data == 7)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[5]);
-    if(receive_data == 8)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[6]);
-    if(receive_data == 9)DL_UART_Main_transmitData(UART_0_INST,adc_upper_thresh[7]);
- 
-
-    
-    
+    if (ch == '\r' || ch == '\n') {
+        if (uart_cmd_idx > 0) {
+            uart_process_command();
+        }
+    } else if (uart_cmd_idx < (UART_CMD_BUF_SIZE - 1)) {
+        uart_cmd_buf[uart_cmd_idx++] = (char)ch;
+    }
+    /* 缓冲区满则丢弃后续字节，等待换行重置 */
 }
 
 /* 
-函数功能：定时发送数据+清除标志位
+函数功能：定时发送数据+清除标志位（TIMER_0 现为1ms中断，软件分频实现多挡位）
 工作流程：
-1，每10ms发送一次数据
-2，通过calib_show_ticks实现无阻塞清除calib_stage标志位
+1，每1ms中断一次，分频计数达到 uart_tx_interval_ms 后发送 ADC_Value_digital
+2，通过calib_show_ticks实现无阻塞清除calib_stage标志位（1ms/tick）
 调用方法：
 等待中断
  */
-void TIMER_0_INST_IRQHandler(void)//该定时器用于每10ms发送一次数据
+void TIMER_0_INST_IRQHandler(void)
 {
     time_count++;
-    if(receive_data == 0)DL_UART_Main_transmitData(UART_0_INST,ADC_Value_digital);
-    
-    /* 处理校准 LED 超时（每个 tick 约 10ms） */
+
+    /* 按当前挡位分频发送 */
+    if (uart_tx_enabled) {
+        uart_tx_tick++;
+        if (uart_tx_tick >= uart_tx_interval_ms) {
+            uart_tx_tick = 0;
+            DL_UART_Main_transmitData(UART_0_INST, ADC_Value_digital);
+        }
+    }
+
+    /* 处理校准 LED 超时（每个 tick = 1ms） */
     if (calib_show_ticks > 0) {
         calib_show_ticks--;
         if (calib_show_ticks == 0) {
-            /* 超时到期：退出校准模式并恢复正常显示 */
             calib_stage = 0;
         }
     }
@@ -451,7 +578,7 @@ void TIMER_2_INST_IRQHandler(void)//用于按键
                     calib_saved_once = 0;
                    
                     /* 指示完成：短时间点亮所有 LED（由 TIMER_0 处理） */
-                    calib_show_ticks = 100; /* 100 * 10ms ≈ 1s */
+                    calib_show_ticks = 1000; /* 1000 * 1ms = 1s */
                 }
             }
             key_prev_state = 0;

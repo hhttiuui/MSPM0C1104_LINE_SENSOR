@@ -1,9 +1,9 @@
 /**
  * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
  * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
- * @cliArgs --device "MSPM0C110X" --part "Default" --package "VSSOP-20(DGS20)" --product "mspm0_sdk@2.05.00.05"
- * @v2CliArgs --device "MSPM0C1104" --package "VSSOP-20(DGS20)" --product "mspm0_sdk@2.05.00.05"
- * @versions {"tool":"1.24.1+4189"}
+ * @cliArgs --device "MSPM0C110X" --part "Default" --package "VSSOP-20(DGS20)" --product "mspm0_sdk@2.10.00.04"
+ * @v2CliArgs --device "MSPM0C1104" --package "VSSOP-20(DGS20)" --product "mspm0_sdk@2.10.00.04"
+ * @versions {"tool":"1.27.0+4565"}
  */
 
 /**
@@ -70,7 +70,7 @@ TIMER1.timerClkPrescale            = 32;
 TIMER1.event1ControllerInterruptEn = ["ZERO_EVENT"];
 TIMER1.timerStartTimer             = true;
 TIMER1.interrupts                  = ["ZERO"];
-TIMER1.timerPeriod                 = "10 ms";
+TIMER1.timerPeriod                 = "1 ms";
 
 TIMER2.$name                       = "TIMER_1";
 TIMER2.timerClkDiv                 = 8;
