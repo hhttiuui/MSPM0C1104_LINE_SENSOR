@@ -87,7 +87,7 @@ typedef struct /* 阈值数据结构 */
 /* 相关函数声明（具体功能见下方）：*/
 void xunji_adc_to_digital(void);
 void LED_show(void);
-void SetupOddChannels(void);//ͨ������
+void SetupOddChannels(void);//通道切换（奇数通道组：CH5/CH0/CH1/CH2）
 void SetupEvenChannels(void);
 void load_all_from_flash(void);
 
