@@ -35,6 +35,8 @@
 | SDK | MSPM0 SDK **2.10.00.04**（`.syscfg` 里写死的版本） |
 | 架构 | NoRTOS 裸机，全部靠中断驱动 |
 
+![8 路红外巡线模块（两块并联，编号 1~8 对应 8 路探头）](docs/images/sensor-module.jpg)
+
 ## 目录结构
 
 ```
